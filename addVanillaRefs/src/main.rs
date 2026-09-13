@@ -19,7 +19,9 @@ fn main() -> std::io::Result<()> {
         .objects_of_type::<MagicEffect>()
         .map(|effect| effect.effect_id)
         .collect();
-    add_vanilla_refs(
+    // Do not let dirty vanilla DialogueInfo records bootstrap their speakers
+    // into the actor population used by dialogue reconstruction.
+    add_vanilla_refs_without_dialogue(
         &mut plugin,
         &base_plugins,
         &mut defined_ids,
@@ -564,8 +566,42 @@ fn add_vanilla_refs(
     defined_ids: &mut HashSet<String>,
     defined_effects: &mut HashSet<EffectId>,
 ) {
+    add_vanilla_refs_with_dialogue(
+        plugin,
+        base_plugins,
+        defined_ids,
+        defined_effects,
+        true,
+    );
+}
+
+fn add_vanilla_refs_without_dialogue(
+    plugin: &mut Plugin,
+    base_plugins: &[Plugin],
+    defined_ids: &mut HashSet<String>,
+    defined_effects: &mut HashSet<EffectId>,
+) {
+    add_vanilla_refs_with_dialogue(
+        plugin,
+        base_plugins,
+        defined_ids,
+        defined_effects,
+        false,
+    );
+}
+
+fn add_vanilla_refs_with_dialogue(
+    plugin: &mut Plugin,
+    base_plugins: &[Plugin],
+    defined_ids: &mut HashSet<String>,
+    defined_effects: &mut HashSet<EffectId>,
+    include_dialogue_dependencies: bool,
+) {
     let vanilla_index = VanillaIndex::new(base_plugins);
-    let mut required_ids = collect_required_ids(plugin);
+    let mut required_ids = collect_required_ids_with_dialogue(
+        plugin,
+        include_dialogue_dependencies,
+    );
     let mut pending_ids: VecDeque<_> = required_ids.iter().cloned().collect();
     pending_ids.make_contiguous().sort();
 
@@ -698,9 +734,17 @@ fn collect_defined_ids(plugin: &Plugin) -> HashSet<String> {
 }
 
 fn collect_required_ids(plugin: &Plugin) -> HashSet<String> {
+    collect_required_ids_with_dialogue(plugin, true)
+}
+
+fn collect_required_ids_with_dialogue(
+    plugin: &Plugin,
+    include_dialogue_dependencies: bool,
+) -> HashSet<String> {
     plugin
         .objects
         .iter()
+        .filter(|object| include_dialogue_dependencies || !matches!(object, TES3Object::DialogueInfo(_)))
         .flat_map(collect_required_ids_from_object)
         .collect()
 }
@@ -1083,6 +1127,39 @@ mod tests {
         assert!(has_id(&plugin, "first_dependency"));
         assert!(has_id(&plugin, "second_dependency"));
         assert!(has_id(&plugin, "third_dependency"));
+    }
+
+    #[test]
+    fn first_closure_defers_dialogue_info_dependencies() {
+        let mut plugin = Plugin {
+            objects: vec![
+                dialogue("Topic"),
+                dialogue_info_with_speaker("Info", "", "", "vanilla_speaker"),
+            ],
+        };
+        let masters = vec![Plugin {
+            objects: vec![misc_item("vanilla_speaker", "")],
+        }];
+        let mut defined_ids = collect_defined_ids(&plugin);
+        let mut defined_effects = HashSet::new();
+
+        add_vanilla_refs_without_dialogue(
+            &mut plugin,
+            &masters,
+            &mut defined_ids,
+            &mut defined_effects,
+        );
+
+        assert!(!has_id(&plugin, "vanilla_speaker"));
+
+        add_vanilla_refs(
+            &mut plugin,
+            &masters,
+            &mut defined_ids,
+            &mut defined_effects,
+        );
+
+        assert!(has_id(&plugin, "vanilla_speaker"));
     }
 
     #[test]
