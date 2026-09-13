@@ -55,6 +55,9 @@ fn main() -> std::io::Result<()> {
         &mut defined_effects,
     );
 
+    strip_deleted_records(&mut plugin);
+    remove_exact_duplicate_magic_effects(&mut plugin);
+
     // Remove masters from the plugin header.
     let header = plugin.header_mut().unwrap();
     header.masters.clear();
@@ -540,7 +543,7 @@ impl<'a> VanillaIndex<'a> {
             .map(|plugin| {
                 let mut records = HashMap::new();
                 for object in &plugin.objects {
-                    if !never_copy(object) {
+                    if !never_copy(object) && !object.deleted() {
                         records
                             .entry(object.editor_id().to_ascii_lowercase())
                             .or_insert(object);
@@ -681,6 +684,9 @@ fn import_vanilla_foundations(
 ) {
     for base_plugin in base_plugins {
         for object in &base_plugin.objects {
+            if object.deleted() {
+                continue;
+            }
             if !matches!(
                 object,
                 TES3Object::GameSetting(_)
@@ -744,9 +750,31 @@ fn collect_required_ids_with_dialogue(
     plugin
         .objects
         .iter()
-        .filter(|object| include_dialogue_dependencies || !matches!(object, TES3Object::DialogueInfo(_)))
+        .filter(|object| !object.deleted())
+        .filter(|object| {
+            include_dialogue_dependencies || !matches!(object, TES3Object::DialogueInfo(_))
+        })
         .flat_map(collect_required_ids_from_object)
         .collect()
+}
+
+fn strip_deleted_records(plugin: &mut Plugin) {
+    plugin.objects.retain(|object| !object.deleted());
+}
+
+fn remove_exact_duplicate_magic_effects(plugin: &mut Plugin) {
+    let mut retained = Vec::new();
+    for object in plugin.objects.drain(..) {
+        if let TES3Object::MagicEffect(effect) = &object {
+            if retained.iter().any(|retained| {
+                matches!(retained, TES3Object::MagicEffect(other) if other == effect)
+            }) {
+                continue;
+            }
+        }
+        retained.push(object);
+    }
+    plugin.objects = retained;
 }
 
 #[expect(
@@ -1160,6 +1188,48 @@ mod tests {
         );
 
         assert!(has_id(&plugin, "vanilla_speaker"));
+    }
+
+    #[test]
+    fn deleted_records_do_not_contribute_dependencies_or_serialize() {
+        let mut deleted = misc_item("deleted_record", "unwanted_dependency");
+        if let TES3Object::MiscItem(item) = &mut deleted {
+            item.flags.insert(ObjectFlags::DELETED);
+        }
+        let mut plugin = Plugin {
+            objects: vec![deleted],
+        };
+        let masters = vec![Plugin {
+            objects: vec![misc_item("unwanted_dependency", "")],
+        }];
+        let mut defined_ids = collect_defined_ids(&plugin);
+        let mut defined_effects = HashSet::new();
+
+        add_vanilla_refs(
+            &mut plugin,
+            &masters,
+            &mut defined_ids,
+            &mut defined_effects,
+        );
+
+        assert!(!has_id(&plugin, "unwanted_dependency"));
+        strip_deleted_records(&mut plugin);
+        assert!(plugin.objects.is_empty());
+    }
+
+    #[test]
+    fn exact_duplicate_magic_effects_are_removed() {
+        let effect = TES3Object::MagicEffect(MagicEffect {
+            effect_id: EffectId::WaterBreathing,
+            ..Default::default()
+        });
+        let mut plugin = Plugin {
+            objects: vec![effect.clone(), effect],
+        };
+
+        remove_exact_duplicate_magic_effects(&mut plugin);
+
+        assert_eq!(plugin.objects_of_type::<MagicEffect>().count(), 1);
     }
 
     #[test]
