@@ -739,6 +739,7 @@ fn collect_defined_ids(plugin: &Plugin) -> HashSet<String> {
     results
 }
 
+#[cfg(test)]
 fn collect_required_ids(plugin: &Plugin) -> HashSet<String> {
     collect_required_ids_with_dialogue(plugin, true)
 }
