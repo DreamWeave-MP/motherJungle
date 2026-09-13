@@ -58,6 +58,8 @@ fn main() -> std::io::Result<()> {
         }
     }
 
+    decouple_dialogue_infos(&mut plugin, &base_plugins);
+
     // Remove masters from the plugin header.
     let header = plugin.header_mut().unwrap();
     header.masters.clear();
@@ -67,6 +69,153 @@ fn main() -> std::io::Result<()> {
     plugin.save_path("Starwind.esp")?;
 
     Ok(())
+}
+
+#[derive(Default)]
+struct DialogueGroup {
+    infos: Vec<DialogueInfo>,
+}
+
+impl DialogueGroup {
+    fn insert_info(&mut self, info: DialogueInfo) {
+        debug_assert!(
+            self.infos
+                .iter()
+                .filter(|existing| same_id(&existing.id, &info.id))
+                .count()
+                <= 1
+        );
+        if let Some(index) = self
+            .infos
+            .iter()
+            .position(|existing| same_id(&existing.id, &info.id))
+        {
+            if same_id(&self.infos[index].prev_id, &info.prev_id) {
+                self.infos[index] = info;
+                return;
+            }
+            self.infos.remove(index);
+        }
+
+        if info.prev_id.is_empty() {
+            self.infos.insert(0, info);
+        } else if let Some(index) = self
+            .infos
+            .iter()
+            .position(|existing| same_id(&existing.id, &info.prev_id))
+        {
+            self.infos.insert(index + 1, info);
+        } else {
+            self.infos.push(info);
+        }
+    }
+}
+
+fn same_id(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+type DialogueRecords = HashMap<String, DialogueGroup>;
+
+fn decouple_dialogue_infos(plugin: &mut Plugin, base_plugins: &[Plugin]) {
+    let effective_records = collect_effective_dialogue_records(plugin, base_plugins);
+    let starwind_ids = collect_dialogue_ids(plugin);
+    let mut links: HashMap<String, HashMap<String, (String, String)>> = HashMap::new();
+
+    for (topic, group) in &effective_records {
+        let Some(starwind_topic_ids) = starwind_ids.get(topic) else {
+            continue;
+        };
+        let survivors: Vec<_> = group
+            .infos
+            .iter()
+            .filter(|info| starwind_topic_ids.contains(&info.id.to_ascii_lowercase()))
+            .collect();
+        let topic_links = links.entry(topic.clone()).or_default();
+        for (index, info) in survivors.iter().enumerate() {
+            let previous = index
+                .checked_sub(1)
+                .and_then(|index| survivors.get(index))
+                .map_or_else(String::new, |info| info.id.clone());
+            let next = survivors
+                .get(index + 1)
+                .map_or_else(String::new, |info| info.id.clone());
+            topic_links.insert(info.id.to_ascii_lowercase(), (previous, next));
+        }
+    }
+
+    let mut topic = None;
+    for object in &mut plugin.objects {
+        match object {
+            TES3Object::Dialogue(dialogue) => topic = Some(dialogue.id.to_ascii_lowercase()),
+            TES3Object::DialogueInfo(info) => {
+                let Some(topic) = topic.as_ref() else {
+                    continue;
+                };
+                let id = info.id.to_ascii_lowercase();
+                let Some((previous, next)) = links.get(topic).and_then(|links| links.get(&id))
+                else {
+                    continue;
+                };
+                info.prev_id.clone_from(previous);
+                info.next_id.clone_from(next);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_effective_dialogue_records(plugin: &Plugin, base_plugins: &[Plugin]) -> DialogueRecords {
+    let mut records = HashMap::new();
+    for base_plugin in base_plugins.iter().rev() {
+        merge_dialogue_records(base_plugin, &mut records);
+    }
+    merge_dialogue_records(plugin, &mut records);
+    records
+}
+
+fn merge_dialogue_records(plugin: &Plugin, records: &mut DialogueRecords) {
+    let mut topic = None;
+    for object in &plugin.objects {
+        match object {
+            TES3Object::Dialogue(dialogue) => topic = Some(dialogue.id.to_ascii_lowercase()),
+            TES3Object::DialogueInfo(info) => {
+                let Some(topic) = topic.as_ref() else {
+                    continue;
+                };
+                let id = info.id.to_ascii_lowercase();
+                if id.is_empty() {
+                    continue;
+                }
+                records
+                    .entry(topic.clone())
+                    .or_default()
+                    .insert_info(info.clone());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_dialogue_ids(plugin: &Plugin) -> HashMap<String, HashSet<String>> {
+    let mut ids: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut topic = None;
+    for object in &plugin.objects {
+        match object {
+            TES3Object::Dialogue(dialogue) => topic = Some(dialogue.id.to_ascii_lowercase()),
+            TES3Object::DialogueInfo(info) => {
+                let Some(topic) = topic.as_ref() else {
+                    continue;
+                };
+                let id = info.id.to_ascii_lowercase();
+                if !id.is_empty() {
+                    ids.entry(topic.clone()).or_default().insert(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    ids
 }
 
 struct VanillaIndex<'a> {
@@ -521,7 +670,9 @@ fn never_copy(object: &TES3Object) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tes3::esp::{AiEscortPackage, AiFollowPackage, Filter, MiscItem, Npc, Race, Spell, Static};
+    use tes3::esp::{
+        AiEscortPackage, AiFollowPackage, Dialogue, Filter, MiscItem, Npc, Race, Spell, Static,
+    };
 
     fn misc_item(id: &str, script: &str) -> TES3Object {
         TES3Object::MiscItem(MiscItem {
@@ -529,6 +680,26 @@ mod tests {
             script: script.to_string(),
             ..Default::default()
         })
+    }
+
+    fn dialogue(id: &str) -> TES3Object {
+        TES3Object::Dialogue(Dialogue {
+            id: id.to_string(),
+            ..Default::default()
+        })
+    }
+
+    fn dialogue_info(id: &str, previous: &str, next: &str) -> TES3Object {
+        TES3Object::DialogueInfo(dialogue_info_value(id, previous, next))
+    }
+
+    fn dialogue_info_value(id: &str, previous: &str, next: &str) -> DialogueInfo {
+        DialogueInfo {
+            id: id.to_string(),
+            prev_id: previous.to_string(),
+            next_id: next.to_string(),
+            ..Default::default()
+        }
     }
 
     fn has_id(plugin: &Plugin, id: &str) -> bool {
@@ -697,5 +868,63 @@ mod tests {
         assert!(!required_ids.contains("sound/dialogue.wav"));
         assert!(!required_ids.contains("filter_operand"));
         assert!(!required_ids.contains(""));
+    }
+
+    #[test]
+    fn dialogue_links_skip_removed_vanilla_infos() {
+        let masters = vec![Plugin {
+            objects: vec![
+                dialogue("Topic"),
+                dialogue_info("V1", "", "V2"),
+                dialogue_info("V2", "V1", "V3"),
+                dialogue_info("V3", "V2", ""),
+            ],
+        }];
+        let mut plugin = Plugin {
+            objects: vec![
+                dialogue("Topic"),
+                dialogue_info("S1", "", "V1"),
+                dialogue_info("S2", "V2", "V3"),
+                dialogue_info("S3", "V3", ""),
+            ],
+        };
+
+        decouple_dialogue_infos(&mut plugin, &masters);
+
+        let infos: Vec<_> = plugin
+            .objects_of_type::<DialogueInfo>()
+            .map(|info| {
+                (
+                    info.id.as_str(),
+                    info.prev_id.as_str(),
+                    info.next_id.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            infos,
+            vec![("S1", "", "S2"), ("S2", "S1", "S3"), ("S3", "S2", ""),]
+        );
+    }
+
+    #[test]
+    fn dialogue_group_matches_ids_case_insensitively() {
+        let mut group = DialogueGroup::default();
+        group.insert_info(dialogue_info_value("First", "", ""));
+        group.insert_info(dialogue_info_value("Third", "First", ""));
+        group.insert_info(dialogue_info_value("second", "first", ""));
+
+        assert_eq!(
+            group
+                .infos
+                .iter()
+                .map(|info| info.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["First", "second", "Third"]
+        );
+
+        group.insert_info(dialogue_info_value("FIRST", "", ""));
+        assert_eq!(group.infos.len(), 3);
+        assert_eq!(group.infos[0].id, "FIRST");
     }
 }
