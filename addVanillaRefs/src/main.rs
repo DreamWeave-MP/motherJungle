@@ -195,7 +195,6 @@ enum DialogueTopicReason {
     StarwindTopic,
     EngineTopic,
     ScriptTopic,
-    DialogueText,
 }
 
 impl DialogueTopicReason {
@@ -204,7 +203,6 @@ impl DialogueTopicReason {
             Self::StarwindTopic => "StarwindTopic",
             Self::EngineTopic => "EngineTopic",
             Self::ScriptTopic => "ScriptTopic",
-            Self::DialogueText => "DialogueText",
         }
     }
 }
@@ -327,17 +325,6 @@ fn collect_live_dialogue_topics(
     for text in &script_texts {
         add_script_topic_references(text, &topic_ids, &mut live_topics);
     }
-    // Only Starwind-authored INFO text may discover additional topics. Walking
-    // vanilla INFO text turns the dialogue database into an almost-global graph.
-    for (topic, starwind_info_ids) in starwind_ids {
-        if let Some(group) = records.get(topic) {
-            for info in &group.infos {
-                if starwind_info_ids.contains(&info.id.to_ascii_lowercase()) {
-                    add_dialogue_topic_references(&info.text, &topic_ids, &mut live_topics);
-                }
-            }
-        }
-    }
     live_topics
 }
 
@@ -371,35 +358,6 @@ fn add_script_topic_references(
                 .entry(topic.clone())
                 .or_default()
                 .insert(DialogueTopicReason::ScriptTopic);
-        }
-    }
-}
-
-fn add_dialogue_topic_references(
-    text: &str,
-    topic_ids: &[String],
-    live_topics: &mut DialogueTopicReasons,
-) {
-    let text = text.to_ascii_lowercase();
-    for topic in topic_ids {
-        let mut offset = 0;
-        while let Some(index) = text[offset..].find(topic) {
-            let start = offset + index;
-            let end = start + topic.len();
-            let before = text[..start].chars().next_back();
-            let after = text[end..].chars().next();
-            let boundary = |character: Option<char>| {
-                character
-                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
-            };
-            if boundary(before) && boundary(after) {
-                live_topics
-                    .entry(topic.clone())
-                    .or_default()
-                    .insert(DialogueTopicReason::DialogueText);
-                break;
-            }
-            offset = end;
         }
     }
 }
@@ -476,9 +434,6 @@ fn add_dialogue_keep_reasons(
     }
     if topic_reasons.is_some_and(|reasons| reasons.contains(&DialogueTopicReason::ScriptTopic)) {
         audit.add_reason("VANILLA_SCRIPT_TOPIC");
-    }
-    if topic_reasons.is_some_and(|reasons| reasons.contains(&DialogueTopicReason::DialogueText)) {
-        audit.add_reason("VANILLA_DIALOGUE_TOPIC");
     }
     if topic_reasons.is_some_and(|reasons| reasons.contains(&DialogueTopicReason::StarwindTopic)) {
         audit.add_reason("VANILLA_DIALOGUE_TOPIC");
@@ -1342,22 +1297,22 @@ mod tests {
     }
 
     #[test]
-    fn vanilla_dialogue_text_does_not_expand_topic_liveness() {
-        let mut vanilla_a_info = dialogue_info("VanillaAInfo", "", "");
-        if let TES3Object::DialogueInfo(info) = &mut vanilla_a_info {
+    fn dialogue_text_does_not_materialize_vanilla_topics() {
+        let mut price_info = dialogue_info("PriceInfo", "", "");
+        if let TES3Object::DialogueInfo(info) = &mut price_info {
             info.text = "VanillaB".to_string();
         }
         let masters = vec![Plugin {
             objects: vec![
-                dialogue("VanillaA"),
-                vanilla_a_info,
+                dialogue("Price on Your Head"),
+                price_info,
                 dialogue("VanillaB"),
                 dialogue_info("VanillaBInfo", "", ""),
             ],
         }];
         let mut starwind_info = dialogue_info("StarwindInfo", "", "");
         if let TES3Object::DialogueInfo(info) = &mut starwind_info {
-            info.text = "VanillaA".to_string();
+            info.text = "price on your head; VanillaB".to_string();
         }
         let mut plugin = Plugin {
             objects: vec![dialogue("StarwindTopic"), starwind_info],
@@ -1365,8 +1320,8 @@ mod tests {
 
         decouple_dialogue_infos(&mut plugin, &masters);
 
-        assert!(has_id(&plugin, "VanillaA"));
-        assert!(has_id(&plugin, "VanillaAInfo"));
+        assert!(!has_id(&plugin, "Price on Your Head"));
+        assert!(!has_id(&plugin, "PriceInfo"));
         assert!(!has_id(&plugin, "VanillaB"));
         assert!(!has_id(&plugin, "VanillaBInfo"));
     }
