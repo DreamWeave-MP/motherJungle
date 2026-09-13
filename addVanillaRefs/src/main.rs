@@ -1,9 +1,9 @@
 use tes3::esp::{
-    AiPackage, DialogueInfo, EditorId, EffectId, FilterType, MagicEffect, Plugin, TES3Object,
-    TypeInfo,
+    AiPackage, Dialogue, DialogueInfo, DialogueType2, EditorId, EffectId, MagicEffect, Plugin,
+    TES3Object, TypeInfo,
 };
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 const VANILLA_PLUGIN_NAMES: [&str; 3] = ["Bloodmoon.esm", "Tribunal.esm", "Morrowind.esm"];
 
@@ -25,21 +25,6 @@ fn main() -> std::io::Result<()> {
         &mut defined_ids,
         &mut defined_effects,
     );
-    for info in plugin.objects_of_type_mut::<DialogueInfo>() {
-        let cell = info.speaker_cell.to_ascii_lowercase();
-        if !defined_ids.contains(&cell) {
-            info.speaker_cell = "igtestcell".to_string();
-        }
-        info.filters.retain(|filter| {
-            if filter.filter_type == FilterType::NotCell {
-                let cell = filter.id.to_ascii_lowercase();
-                defined_ids.contains(&cell)
-            } else {
-                true
-            }
-        });
-    }
-
     for object in &mut plugin.objects {
         let ai_packages = match object {
             TES3Object::Creature(creature) => &mut creature.ai_packages,
@@ -73,6 +58,8 @@ fn main() -> std::io::Result<()> {
 
 #[derive(Default)]
 struct DialogueGroup {
+    dialogue: Dialogue,
+    dialogue_type: DialogueType2,
     infos: Vec<DialogueInfo>,
 }
 
@@ -120,49 +107,364 @@ type DialogueRecords = HashMap<String, DialogueGroup>;
 fn decouple_dialogue_infos(plugin: &mut Plugin, base_plugins: &[Plugin]) {
     let effective_records = collect_effective_dialogue_records(plugin, base_plugins);
     let starwind_ids = collect_dialogue_ids(plugin);
-    let mut links: HashMap<String, HashMap<String, (String, String)>> = HashMap::new();
+    let population = collect_dialogue_population(plugin);
+    let live_topics = collect_live_dialogue_topics(plugin, &effective_records, &starwind_ids);
+    let (live_infos, audit) =
+        collect_live_dialogue_infos(&effective_records, &starwind_ids, &live_topics, &population);
+    audit.print();
 
-    for (topic, group) in &effective_records {
-        let Some(starwind_topic_ids) = starwind_ids.get(topic) else {
-            continue;
-        };
-        let survivors: Vec<_> = group
-            .infos
-            .iter()
-            .filter(|info| starwind_topic_ids.contains(&info.id.to_ascii_lowercase()))
-            .collect();
-        let topic_links = links.entry(topic.clone()).or_default();
-        for (index, info) in survivors.iter().enumerate() {
-            let previous = index
-                .checked_sub(1)
-                .and_then(|index| survivors.get(index))
-                .map_or_else(String::new, |info| info.id.clone());
-            let next = survivors
-                .get(index + 1)
-                .map_or_else(String::new, |info| info.id.clone());
-            topic_links.insert(info.id.to_ascii_lowercase(), (previous, next));
+    let mut rebuilt = Vec::with_capacity(plugin.objects.len());
+    let mut emitted_topics = HashSet::new();
+    for object in plugin.objects.drain(..) {
+        match object {
+            TES3Object::Dialogue(dialogue) => {
+                let topic = dialogue.id.to_ascii_lowercase();
+                rebuilt.push(TES3Object::Dialogue(dialogue));
+                let Some(group) = effective_records.get(&topic) else {
+                    continue;
+                };
+                let Some(live_ids) = live_infos.get(&topic) else {
+                    continue;
+                };
+                append_live_dialogue_infos(&mut rebuilt, group, live_ids);
+                emitted_topics.insert(topic);
+            }
+            TES3Object::DialogueInfo(_) => {}
+            object => rebuilt.push(object),
         }
     }
+    let mut missing_topics: Vec<_> = live_topics
+        .keys()
+        .filter(|topic| !emitted_topics.contains(*topic))
+        .collect();
+    missing_topics.sort();
+    for topic in missing_topics {
+        let Some(group) = effective_records.get(topic) else {
+            continue;
+        };
+        let Some(live_ids) = live_infos.get(topic) else {
+            continue;
+        };
+        if group.dialogue.id.is_empty() {
+            continue;
+        }
+        rebuilt.push(TES3Object::Dialogue(group.dialogue.clone()));
+        append_live_dialogue_infos(&mut rebuilt, group, live_ids);
+    }
+    plugin.objects = rebuilt;
+}
 
-    let mut topic = None;
-    for object in &mut plugin.objects {
+fn append_live_dialogue_infos(
+    rebuilt: &mut Vec<TES3Object>,
+    group: &DialogueGroup,
+    live_ids: &HashSet<String>,
+) {
+    let survivors: Vec<_> = group
+        .infos
+        .iter()
+        .filter(|info| live_ids.contains(&info.id.to_ascii_lowercase()))
+        .collect();
+    for (index, info) in survivors.iter().enumerate() {
+        let mut info = (*info).clone();
+        info.prev_id = index
+            .checked_sub(1)
+            .and_then(|index| survivors.get(index))
+            .map_or_else(String::new, |info| info.id.clone());
+        info.next_id = survivors
+            .get(index + 1)
+            .map_or_else(String::new, |info| info.id.clone());
+        rebuilt.push(TES3Object::DialogueInfo(info));
+    }
+}
+
+struct DialoguePopulation {
+    actors: Vec<DialogueActor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum DialogueTopicReason {
+    StarwindTopic,
+    EngineTopic,
+    ScriptTopic,
+    DialogueText,
+}
+
+type DialogueTopicReasons = HashMap<String, HashSet<DialogueTopicReason>>;
+
+#[derive(Default)]
+struct DialogueAudit {
+    effective_infos: usize,
+    starwind_owned_infos: usize,
+    retained_vanilla_infos: usize,
+    pruned_vanilla_infos: usize,
+    keep_reasons: BTreeMap<&'static str, usize>,
+}
+
+impl DialogueAudit {
+    fn add_reason(&mut self, reason: &'static str) {
+        *self.keep_reasons.entry(reason).or_default() += 1;
+    }
+
+    fn print(&self) {
+        println!(
+            "Dialogue INFO audit: effective={}, starwind_owned={}, retained_vanilla={}, pruned_vanilla={}",
+            self.effective_infos,
+            self.starwind_owned_infos,
+            self.retained_vanilla_infos,
+            self.pruned_vanilla_infos,
+        );
+        for (reason, count) in &self.keep_reasons {
+            println!("Dialogue INFO keep reason: {reason}={count}");
+        }
+    }
+}
+
+struct DialogueActor {
+    id: String,
+    race: String,
+    class: String,
+}
+
+fn collect_dialogue_population(plugin: &Plugin) -> DialoguePopulation {
+    let mut population = DialoguePopulation { actors: Vec::new() };
+    for object in &plugin.objects {
         match object {
-            TES3Object::Dialogue(dialogue) => topic = Some(dialogue.id.to_ascii_lowercase()),
-            TES3Object::DialogueInfo(info) => {
-                let Some(topic) = topic.as_ref() else {
-                    continue;
-                };
-                let id = info.id.to_ascii_lowercase();
-                let Some((previous, next)) = links.get(topic).and_then(|links| links.get(&id))
-                else {
-                    continue;
-                };
-                info.prev_id.clone_from(previous);
-                info.next_id.clone_from(next);
-            }
+            TES3Object::Npc(npc) => population.actors.push(DialogueActor {
+                id: npc.id.to_ascii_lowercase(),
+                race: npc.race.to_ascii_lowercase(),
+                class: npc.class.to_ascii_lowercase(),
+            }),
+            TES3Object::Creature(creature) => population.actors.push(DialogueActor {
+                id: creature.id.to_ascii_lowercase(),
+                race: String::new(),
+                class: String::new(),
+            }),
             _ => {}
         }
     }
+    population
+}
+
+fn collect_live_dialogue_topics(
+    plugin: &Plugin,
+    records: &DialogueRecords,
+    starwind_ids: &HashMap<String, HashSet<String>>,
+) -> DialogueTopicReasons {
+    let mut live_topics = DialogueTopicReasons::new();
+    for topic in starwind_ids.keys() {
+        live_topics
+            .entry(topic.clone())
+            .or_default()
+            .insert(DialogueTopicReason::StarwindTopic);
+    }
+    for (topic, group) in records {
+        if matches!(
+            group.dialogue_type,
+            DialogueType2::Greeting | DialogueType2::Voice | DialogueType2::Persuasion
+        ) {
+            live_topics
+                .entry(topic.clone())
+                .or_default()
+                .insert(DialogueTopicReason::EngineTopic);
+        }
+    }
+
+    let topic_ids: Vec<_> = records
+        .keys()
+        .filter(|topic| !topic.is_empty())
+        .cloned()
+        .collect();
+    let script_texts: Vec<_> = plugin
+        .objects
+        .iter()
+        .filter_map(|object| match object {
+            TES3Object::Script(script) => Some(script.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    loop {
+        let old_len = live_topics.len();
+        for text in &script_texts {
+            add_script_topic_references(text, &topic_ids, &mut live_topics);
+        }
+        for topic in live_topics.keys().cloned().collect::<Vec<_>>() {
+            if let Some(group) = records.get(&topic) {
+                for info in &group.infos {
+                    add_dialogue_topic_references(&info.text, &topic_ids, &mut live_topics);
+                }
+            }
+        }
+        if live_topics.len() == old_len {
+            break;
+        }
+    }
+    live_topics
+}
+
+fn add_script_topic_references(
+    text: &str,
+    topic_ids: &[String],
+    live_topics: &mut DialogueTopicReasons,
+) {
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.starts_with(';') || line.len() < "AddTopic".len() {
+            continue;
+        }
+        let (command, rest) = line.split_at("AddTopic".len());
+        if !command.eq_ignore_ascii_case("AddTopic")
+            || !rest.chars().next().is_some_and(char::is_whitespace)
+        {
+            continue;
+        }
+        let operand = rest.trim_start();
+        let operand = if let Some(operand) = operand.strip_prefix('"') {
+            operand.split('"').next().unwrap_or_default()
+        } else {
+            operand.split_whitespace().next().unwrap_or_default()
+        };
+        if let Some(topic) = topic_ids
+            .iter()
+            .find(|topic| topic.eq_ignore_ascii_case(operand))
+        {
+            live_topics
+                .entry(topic.clone())
+                .or_default()
+                .insert(DialogueTopicReason::ScriptTopic);
+        }
+    }
+}
+
+fn add_dialogue_topic_references(
+    text: &str,
+    topic_ids: &[String],
+    live_topics: &mut DialogueTopicReasons,
+) {
+    let text = text.to_ascii_lowercase();
+    for topic in topic_ids {
+        let mut offset = 0;
+        while let Some(index) = text[offset..].find(topic) {
+            let start = offset + index;
+            let end = start + topic.len();
+            let before = text[..start].chars().next_back();
+            let after = text[end..].chars().next();
+            let boundary = |character: Option<char>| {
+                character
+                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+            };
+            if boundary(before) && boundary(after) {
+                live_topics
+                    .entry(topic.clone())
+                    .or_default()
+                    .insert(DialogueTopicReason::DialogueText);
+                break;
+            }
+            offset = end;
+        }
+    }
+}
+
+fn collect_live_dialogue_infos(
+    records: &DialogueRecords,
+    starwind_ids: &HashMap<String, HashSet<String>>,
+    live_topics: &DialogueTopicReasons,
+    population: &DialoguePopulation,
+) -> (HashMap<String, HashSet<String>>, DialogueAudit) {
+    let mut live_infos = HashMap::new();
+    let mut audit = DialogueAudit::default();
+    for (topic, group) in records {
+        let starwind_topic_ids = starwind_ids.get(topic);
+        let topic_reasons = live_topics.get(topic);
+        for info in &group.infos {
+            let id = info.id.to_ascii_lowercase();
+            audit.effective_infos += 1;
+            let starwind_owned = starwind_topic_ids.is_some_and(|ids| ids.contains(&id));
+            if starwind_owned {
+                audit.starwind_owned_infos += 1;
+            }
+            let live = topic_reasons.is_some()
+                && (starwind_owned || info_can_match_actor(info, population));
+            if live {
+                live_infos
+                    .entry(topic.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(id);
+                if !starwind_owned {
+                    audit.retained_vanilla_infos += 1;
+                    add_dialogue_keep_reasons(&mut audit, topic_reasons, group, info);
+                }
+            } else if !starwind_owned {
+                audit.pruned_vanilla_infos += 1;
+            }
+        }
+    }
+    (live_infos, audit)
+}
+
+fn add_dialogue_keep_reasons(
+    audit: &mut DialogueAudit,
+    topic_reasons: Option<&HashSet<DialogueTopicReason>>,
+    group: &DialogueGroup,
+    info: &DialogueInfo,
+) {
+    let speaker_id = info.speaker_id.to_ascii_lowercase();
+    let race = info.speaker_race.to_ascii_lowercase();
+    let class = info.speaker_class.to_ascii_lowercase();
+    let faction = info.speaker_faction.to_ascii_lowercase();
+    if speaker_id.is_empty()
+        && race.is_empty()
+        && class.is_empty()
+        && faction.is_empty()
+        && matches!(
+            group.dialogue_type,
+            DialogueType2::Greeting | DialogueType2::Voice | DialogueType2::Persuasion
+        )
+    {
+        audit.add_reason("VANILLA_ENGINE_TOPIC_GENERIC");
+    }
+    if !speaker_id.is_empty() {
+        audit.add_reason("VANILLA_MATCHING_SPEAKER_ID");
+    }
+    if !race.is_empty() {
+        audit.add_reason("VANILLA_MATCHING_RACE");
+    }
+    if !class.is_empty() {
+        audit.add_reason("VANILLA_MATCHING_CLASS");
+    }
+    if !faction.is_empty() {
+        audit.add_reason("VANILLA_FACTION_UNKNOWN");
+    }
+    if topic_reasons.is_some_and(|reasons| reasons.contains(&DialogueTopicReason::ScriptTopic)) {
+        audit.add_reason("VANILLA_SCRIPT_TOPIC");
+    }
+    if topic_reasons.is_some_and(|reasons| reasons.contains(&DialogueTopicReason::DialogueText)) {
+        audit.add_reason("VANILLA_DIALOGUE_TOPIC");
+    }
+    if topic_reasons.is_some_and(|reasons| reasons.contains(&DialogueTopicReason::StarwindTopic)) {
+        audit.add_reason("VANILLA_DIALOGUE_TOPIC");
+    }
+}
+
+fn info_can_match_actor(info: &DialogueInfo, population: &DialoguePopulation) -> bool {
+    let speaker_id = info.speaker_id.to_ascii_lowercase();
+    let race = info.speaker_race.to_ascii_lowercase();
+    let class = info.speaker_class.to_ascii_lowercase();
+    let faction = info.speaker_faction.to_ascii_lowercase();
+    let has_known_constraints = !speaker_id.is_empty() || !race.is_empty() || !class.is_empty();
+    let has_candidate = population.actors.iter().any(|actor| {
+        (speaker_id.is_empty() || same_id(&actor.id, &speaker_id))
+            && (race.is_empty() || same_id(&actor.race, &race))
+            && (class.is_empty() || same_id(&actor.class, &class))
+    });
+    if has_known_constraints && !has_candidate {
+        return false;
+    }
+    if !faction.is_empty() {
+        // Runtime faction membership and rank are not represented by an actor
+        // definition, so faction constraints cannot prove an INFO impossible.
+        return true;
+    }
+    true
 }
 
 fn collect_effective_dialogue_records(plugin: &Plugin, base_plugins: &[Plugin]) -> DialogueRecords {
@@ -178,7 +480,12 @@ fn merge_dialogue_records(plugin: &Plugin, records: &mut DialogueRecords) {
     let mut topic = None;
     for object in &plugin.objects {
         match object {
-            TES3Object::Dialogue(dialogue) => topic = Some(dialogue.id.to_ascii_lowercase()),
+            TES3Object::Dialogue(dialogue) => {
+                let group = records.entry(dialogue.id.to_ascii_lowercase()).or_default();
+                group.dialogue = dialogue.clone();
+                group.dialogue_type = dialogue.dialogue_type;
+                topic = Some(dialogue.id.to_ascii_lowercase());
+            }
             TES3Object::DialogueInfo(info) => {
                 let Some(topic) = topic.as_ref() else {
                     continue;
@@ -202,7 +509,11 @@ fn collect_dialogue_ids(plugin: &Plugin) -> HashMap<String, HashSet<String>> {
     let mut topic = None;
     for object in &plugin.objects {
         match object {
-            TES3Object::Dialogue(dialogue) => topic = Some(dialogue.id.to_ascii_lowercase()),
+            TES3Object::Dialogue(dialogue) => {
+                let id = dialogue.id.to_ascii_lowercase();
+                ids.entry(id.clone()).or_default();
+                topic = Some(id);
+            }
             TES3Object::DialogueInfo(info) => {
                 let Some(topic) = topic.as_ref() else {
                     continue;
@@ -671,7 +982,8 @@ fn never_copy(object: &TES3Object) -> bool {
 mod tests {
     use super::*;
     use tes3::esp::{
-        AiEscortPackage, AiFollowPackage, Dialogue, Filter, MiscItem, Npc, Race, Spell, Static,
+        AiEscortPackage, AiFollowPackage, Dialogue, Filter, MiscItem, Npc, Race, Script, Spell,
+        Static,
     };
 
     fn misc_item(id: &str, script: &str) -> TES3Object {
@@ -689,8 +1001,27 @@ mod tests {
         })
     }
 
+    fn dialogue_with_type(id: &str, dialogue_type: DialogueType2) -> TES3Object {
+        TES3Object::Dialogue(Dialogue {
+            id: id.to_string(),
+            dialogue_type,
+            ..Default::default()
+        })
+    }
+
     fn dialogue_info(id: &str, previous: &str, next: &str) -> TES3Object {
         TES3Object::DialogueInfo(dialogue_info_value(id, previous, next))
+    }
+
+    fn dialogue_info_with_speaker(
+        id: &str,
+        previous: &str,
+        next: &str,
+        speaker_id: &str,
+    ) -> TES3Object {
+        let mut info = dialogue_info_value(id, previous, next);
+        info.speaker_id = speaker_id.to_string();
+        TES3Object::DialogueInfo(info)
     }
 
     fn dialogue_info_value(id: &str, previous: &str, next: &str) -> DialogueInfo {
@@ -700,6 +1031,23 @@ mod tests {
             next_id: next.to_string(),
             ..Default::default()
         }
+    }
+
+    fn dialogue_info_with_constraints(
+        id: &str,
+        speaker_id: &str,
+        race: &str,
+        class: &str,
+        faction: &str,
+    ) -> TES3Object {
+        TES3Object::DialogueInfo(DialogueInfo {
+            id: id.to_string(),
+            speaker_id: speaker_id.to_string(),
+            speaker_race: race.to_string(),
+            speaker_class: class.to_string(),
+            speaker_faction: faction.to_string(),
+            ..Default::default()
+        })
     }
 
     fn has_id(plugin: &Plugin, id: &str) -> bool {
@@ -872,18 +1220,30 @@ mod tests {
 
     #[test]
     fn dialogue_links_skip_removed_vanilla_infos() {
+        let mut usable_vanilla_info = dialogue_info("V2", "V1", "V3");
+        if let TES3Object::DialogueInfo(info) = &mut usable_vanilla_info {
+            info.speaker_cell = "MissingCell".to_string();
+        }
         let masters = vec![Plugin {
             objects: vec![
                 dialogue("Topic"),
-                dialogue_info("V1", "", "V2"),
-                dialogue_info("V2", "V1", "V3"),
-                dialogue_info("V3", "V2", ""),
+                dialogue_info_with_speaker("V1", "", "V2", "missing_actor"),
+                usable_vanilla_info,
+                dialogue_info_with_speaker("V3", "V2", "", "missing_actor"),
             ],
         }];
+        let mut first_starwind_info = dialogue_info("S1", "", "V1");
+        if let TES3Object::DialogueInfo(info) = &mut first_starwind_info {
+            info.speaker_cell = "VanillaCell".to_string();
+            info.filters = vec![Filter {
+                id: "filter_operand".to_string(),
+                ..Default::default()
+            }];
+        }
         let mut plugin = Plugin {
             objects: vec![
                 dialogue("Topic"),
-                dialogue_info("S1", "", "V1"),
+                first_starwind_info,
                 dialogue_info("S2", "V2", "V3"),
                 dialogue_info("S3", "V3", ""),
             ],
@@ -903,8 +1263,133 @@ mod tests {
             .collect();
         assert_eq!(
             infos,
-            vec![("S1", "", "S2"), ("S2", "S1", "S3"), ("S3", "S2", ""),]
+            vec![
+                ("S1", "", "V2"),
+                ("V2", "S1", "S2"),
+                ("S2", "V2", "S3"),
+                ("S3", "S2", ""),
+            ]
         );
+        let first_info = plugin.objects_of_type::<DialogueInfo>().next().unwrap();
+        assert_eq!(first_info.speaker_cell, "VanillaCell");
+        assert_eq!(first_info.filters[0].id, "filter_operand");
+    }
+
+    #[test]
+    fn live_vanilla_only_topic_is_materialized() {
+        let masters = vec![Plugin {
+            objects: vec![
+                dialogue("VanillaTopic"),
+                dialogue_info("VanillaInfo", "", ""),
+                dialogue("Ship"),
+                dialogue_info("ShipInfo", "", ""),
+            ],
+        }];
+        let mut plugin = Plugin {
+            objects: vec![TES3Object::Script(Script {
+                id: "starwind_script".to_string(),
+                text: "AddTopic \"VanillaTopic\"".to_string(),
+                ..Default::default()
+            })],
+        };
+
+        decouple_dialogue_infos(&mut plugin, &masters);
+
+        assert!(has_id(&plugin, "VanillaTopic"));
+        assert!(has_id(&plugin, "VanillaInfo"));
+        assert!(!has_id(&plugin, "Ship"));
+        assert!(!has_id(&plugin, "ShipInfo"));
+    }
+
+    #[test]
+    fn engine_driven_voice_topic_is_materialized() {
+        let masters = vec![Plugin {
+            objects: vec![
+                dialogue_with_type("EngineVoice", DialogueType2::Voice),
+                dialogue_info("VanillaVoiceInfo", "", ""),
+            ],
+        }];
+        let mut plugin = Plugin::new();
+
+        decouple_dialogue_infos(&mut plugin, &masters);
+
+        assert!(has_id(&plugin, "EngineVoice"));
+        assert!(has_id(&plugin, "VanillaVoiceInfo"));
+    }
+
+    #[test]
+    fn matching_actor_constraints_retain_vanilla_info() {
+        let masters = vec![Plugin {
+            objects: vec![
+                dialogue("Topic"),
+                dialogue_info_with_constraints("VanillaInfo", "", "Nord", "Warrior", ""),
+            ],
+        }];
+        let mut plugin = Plugin {
+            objects: vec![
+                TES3Object::Npc(Npc {
+                    id: "speaker".to_string(),
+                    race: "Nord".to_string(),
+                    class: "Warrior".to_string(),
+                    ..Default::default()
+                }),
+                dialogue("Topic"),
+                dialogue_info("StarwindInfo", "", ""),
+            ],
+        };
+
+        decouple_dialogue_infos(&mut plugin, &masters);
+
+        assert!(has_id(&plugin, "VanillaInfo"));
+    }
+
+    #[test]
+    fn incompatible_actor_constraints_prune_vanilla_info() {
+        let masters = vec![Plugin {
+            objects: vec![
+                dialogue("Topic"),
+                dialogue_info_with_constraints("VanillaInfo", "", "Dunmer", "Warrior", ""),
+            ],
+        }];
+        let mut plugin = Plugin {
+            objects: vec![
+                TES3Object::Npc(Npc {
+                    id: "speaker".to_string(),
+                    race: "Nord".to_string(),
+                    class: "Warrior".to_string(),
+                    ..Default::default()
+                }),
+                dialogue("Topic"),
+                dialogue_info("StarwindInfo", "", ""),
+            ],
+        };
+
+        decouple_dialogue_infos(&mut plugin, &masters);
+
+        assert!(!has_id(&plugin, "VanillaInfo"));
+    }
+
+    #[test]
+    fn impossible_speaker_id_prunes_info_even_with_unknown_faction() {
+        let masters = vec![Plugin {
+            objects: vec![
+                dialogue("Topic"),
+                dialogue_info_with_constraints(
+                    "VanillaInfo",
+                    "missing_speaker",
+                    "",
+                    "",
+                    "some_faction",
+                ),
+            ],
+        }];
+        let mut plugin = Plugin {
+            objects: vec![dialogue("Topic"), dialogue_info("StarwindInfo", "", "")],
+        };
+
+        decouple_dialogue_infos(&mut plugin, &masters);
+
+        assert!(!has_id(&plugin, "VanillaInfo"));
     }
 
     #[test]
