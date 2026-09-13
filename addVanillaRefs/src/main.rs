@@ -1,6 +1,6 @@
 use tes3::esp::{
-    AiPackage, Dialogue, DialogueInfo, DialogueType2, EditorId, EffectId, MagicEffect, Plugin,
-    TES3Object, TypeInfo,
+    AiPackage, Dialogue, DialogueInfo, DialogueType2, EditorId, EffectId, MagicEffect, ObjectInfo,
+    Plugin, TES3Object, TypeInfo,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -171,7 +171,7 @@ fn append_live_dialogue_infos(
     let survivors: Vec<_> = group
         .infos
         .iter()
-        .filter(|info| live_ids.contains(&info.id.to_ascii_lowercase()))
+        .filter(|info| !info.deleted() && live_ids.contains(&info.id.to_ascii_lowercase()))
         .collect();
     for (index, info) in survivors.iter().enumerate() {
         let mut info = (*info).clone();
@@ -375,6 +375,9 @@ fn collect_live_dialogue_infos(
         let topic_reasons = live_topics.get(topic);
         for info in &group.infos {
             let id = info.id.to_ascii_lowercase();
+            if info.deleted() {
+                continue;
+            }
             audit.effective_infos += 1;
             let starwind_owned = starwind_topic_ids.is_some_and(|ids| ids.contains(&id));
             if starwind_owned {
@@ -514,7 +517,7 @@ fn collect_dialogue_ids(plugin: &Plugin) -> HashMap<String, HashSet<String>> {
                     continue;
                 };
                 let id = info.id.to_ascii_lowercase();
-                if !id.is_empty() {
+                if !id.is_empty() && !info.deleted() {
                     ids.entry(topic.clone()).or_default().insert(id);
                 }
             }
@@ -977,8 +980,8 @@ fn never_copy(object: &TES3Object) -> bool {
 mod tests {
     use super::*;
     use tes3::esp::{
-        AiEscortPackage, AiFollowPackage, Dialogue, Faction, Filter, MiscItem, Npc, Race, Script,
-        Spell, Static,
+        AiEscortPackage, AiFollowPackage, Dialogue, Faction, Filter, MiscItem, Npc, ObjectFlags,
+        Race, Script, Spell, Static,
     };
 
     fn misc_item(id: &str, script: &str) -> TES3Object {
@@ -1511,6 +1514,23 @@ mod tests {
         assert!(has_id(&plugin, "DeadTopic"));
         assert!(has_id(&plugin, "LiveTopic"));
         assert!(has_id(&plugin, "LiveInfo"));
+    }
+
+    #[test]
+    fn deleted_dialogue_info_suppresses_parent_without_serializing_tombstone() {
+        let mut deleted_info = dialogue_info_value("VanillaInfo", "", "");
+        deleted_info.flags.insert(ObjectFlags::DELETED);
+        let base_plugins = vec![Plugin {
+            objects: vec![dialogue("Topic"), dialogue_info("VanillaInfo", "", "")],
+        }];
+        let mut plugin = Plugin {
+            objects: vec![dialogue("Topic"), TES3Object::DialogueInfo(deleted_info)],
+        };
+
+        decouple_dialogue_infos(&mut plugin, &base_plugins);
+
+        assert!(has_id(&plugin, "Topic"));
+        assert_eq!(plugin.objects_of_type::<DialogueInfo>().count(), 0);
     }
 
     #[test]
