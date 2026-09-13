@@ -65,35 +65,33 @@ struct DialogueGroup {
 
 impl DialogueGroup {
     fn insert_info(&mut self, info: DialogueInfo) {
-        debug_assert!(
-            self.infos
-                .iter()
-                .filter(|existing| same_id(&existing.id, &info.id))
-                .count()
-                <= 1
-        );
-        if let Some(index) = self
+        let existing_index = self
             .infos
             .iter()
-            .position(|existing| same_id(&existing.id, &info.id))
-        {
+            .position(|existing| same_id(&existing.id, &info.id));
+        if let Some(index) = existing_index {
             if same_id(&self.infos[index].prev_id, &info.prev_id) {
                 self.infos[index] = info;
                 return;
             }
-            self.infos.remove(index);
         }
 
-        if info.prev_id.is_empty() {
-            self.infos.insert(0, info);
-        } else if let Some(index) = self
-            .infos
-            .iter()
-            .position(|existing| same_id(&existing.id, &info.prev_id))
-        {
-            self.infos.insert(index + 1, info);
+        // OpenMW computes the insertion point before moving an existing node.
+        // This matters when prev_id refers to that same node.
+        let before_index = if info.prev_id.is_empty() {
+            0
         } else {
-            self.infos.push(info);
+            self.infos
+                .iter()
+                .position(|existing| same_id(&existing.id, &info.prev_id))
+                .map_or(self.infos.len(), |index| index + 1)
+        };
+        if let Some(index) = existing_index {
+            let insertion_index = before_index - usize::from(index < before_index);
+            self.infos.remove(index);
+            self.infos.insert(insertion_index, info);
+        } else {
+            self.infos.insert(before_index, info);
         }
     }
 }
@@ -119,14 +117,16 @@ fn decouple_dialogue_infos(plugin: &mut Plugin, base_plugins: &[Plugin]) {
         match object {
             TES3Object::Dialogue(dialogue) => {
                 let topic = dialogue.id.to_ascii_lowercase();
-                rebuilt.push(TES3Object::Dialogue(dialogue));
+                if emitted_topics.contains(&topic) {
+                    continue;
+                }
                 let Some(group) = effective_records.get(&topic) else {
                     continue;
                 };
-                let Some(live_ids) = live_infos.get(&topic) else {
-                    continue;
-                };
-                append_live_dialogue_infos(&mut rebuilt, group, live_ids);
+                rebuilt.push(TES3Object::Dialogue(dialogue));
+                if let Some(live_ids) = live_infos.get(&topic) {
+                    append_live_dialogue_infos(&mut rebuilt, group, live_ids);
+                }
                 emitted_topics.insert(topic);
             }
             TES3Object::DialogueInfo(_) => {}
@@ -497,7 +497,7 @@ fn merge_dialogue_records(plugin: &Plugin, records: &mut DialogueRecords) {
                     .or_default()
                     .insert_info(info.clone());
             }
-            _ => {}
+            _ => topic = None,
         }
     }
 }
@@ -521,7 +521,7 @@ fn collect_dialogue_ids(plugin: &Plugin) -> HashMap<String, HashSet<String>> {
                     ids.entry(topic.clone()).or_default().insert(id);
                 }
             }
-            _ => {}
+            _ => topic = None,
         }
     }
     ids
@@ -1439,5 +1439,66 @@ mod tests {
         group.insert_info(dialogue_info_value("FIRST", "", ""));
         assert_eq!(group.infos.len(), 3);
         assert_eq!(group.infos[0].id, "FIRST");
+    }
+
+    #[test]
+    fn dialogue_group_moves_existing_info_using_openmw_insertion_point() {
+        let mut group = DialogueGroup::default();
+        group.insert_info(dialogue_info_value("First", "", ""));
+        group.insert_info(dialogue_info_value("Second", "First", ""));
+
+        group.insert_info(dialogue_info_value("First", "First", ""));
+
+        assert_eq!(
+            group
+                .infos
+                .iter()
+                .map(|info| info.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["First", "Second"]
+        );
+    }
+
+    #[test]
+    fn starwind_dialogue_shell_is_preserved_without_live_infos() {
+        let masters = vec![Plugin {
+            objects: vec![dialogue("DeadTopic")],
+        }];
+        let mut plugin = Plugin {
+            objects: vec![
+                dialogue("DeadTopic"),
+                dialogue("LiveTopic"),
+                dialogue_info("LiveInfo", "", ""),
+            ],
+        };
+
+        decouple_dialogue_infos(&mut plugin, &masters);
+
+        assert!(has_id(&plugin, "DeadTopic"));
+        assert!(has_id(&plugin, "LiveTopic"));
+        assert!(has_id(&plugin, "LiveInfo"));
+    }
+
+    #[test]
+    fn duplicate_dialogue_shell_is_serialized_once() {
+        let mut plugin = Plugin {
+            objects: vec![
+                dialogue("Topic"),
+                dialogue_info("Info", "", ""),
+                dialogue("Topic"),
+            ],
+        };
+
+        decouple_dialogue_infos(&mut plugin, &[]);
+
+        assert_eq!(
+            plugin
+                .objects
+                .iter()
+                .filter(|object| matches!(object, TES3Object::Dialogue(_)))
+                .count(),
+            1
+        );
+        assert_eq!(plugin.objects_of_type::<DialogueInfo>().count(), 1);
     }
 }
