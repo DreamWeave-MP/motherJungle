@@ -282,20 +282,18 @@ fn collect_live_dialogue_topics(
             _ => None,
         })
         .collect();
-    loop {
-        let old_len = live_topics.len();
-        for text in &script_texts {
-            add_script_topic_references(text, &topic_ids, &mut live_topics);
-        }
-        for topic in live_topics.keys().cloned().collect::<Vec<_>>() {
-            if let Some(group) = records.get(&topic) {
-                for info in &group.infos {
+    for text in &script_texts {
+        add_script_topic_references(text, &topic_ids, &mut live_topics);
+    }
+    // Only Starwind-authored INFO text may discover additional topics. Walking
+    // vanilla INFO text turns the dialogue database into an almost-global graph.
+    for (topic, starwind_info_ids) in starwind_ids {
+        if let Some(group) = records.get(topic) {
+            for info in &group.infos {
+                if starwind_info_ids.contains(&info.id.to_ascii_lowercase()) {
                     add_dialogue_topic_references(&info.text, &topic_ids, &mut live_topics);
                 }
             }
-        }
-        if live_topics.len() == old_len {
-            break;
         }
     }
     live_topics
@@ -1299,6 +1297,36 @@ mod tests {
         assert!(has_id(&plugin, "VanillaInfo"));
         assert!(!has_id(&plugin, "Ship"));
         assert!(!has_id(&plugin, "ShipInfo"));
+    }
+
+    #[test]
+    fn vanilla_dialogue_text_does_not_expand_topic_liveness() {
+        let mut vanilla_a_info = dialogue_info("VanillaAInfo", "", "");
+        if let TES3Object::DialogueInfo(info) = &mut vanilla_a_info {
+            info.text = "VanillaB".to_string();
+        }
+        let masters = vec![Plugin {
+            objects: vec![
+                dialogue("VanillaA"),
+                vanilla_a_info,
+                dialogue("VanillaB"),
+                dialogue_info("VanillaBInfo", "", ""),
+            ],
+        }];
+        let mut starwind_info = dialogue_info("StarwindInfo", "", "");
+        if let TES3Object::DialogueInfo(info) = &mut starwind_info {
+            info.text = "VanillaA".to_string();
+        }
+        let mut plugin = Plugin {
+            objects: vec![dialogue("StarwindTopic"), starwind_info],
+        };
+
+        decouple_dialogue_infos(&mut plugin, &masters);
+
+        assert!(has_id(&plugin, "VanillaA"));
+        assert!(has_id(&plugin, "VanillaAInfo"));
+        assert!(!has_id(&plugin, "VanillaB"));
+        assert!(!has_id(&plugin, "VanillaBInfo"));
     }
 
     #[test]
