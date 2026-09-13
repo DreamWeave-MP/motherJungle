@@ -1,6 +1,6 @@
 use tes3::esp::{
-    AiPackage, Dialogue, DialogueInfo, DialogueType2, EditorId, EffectId, MagicEffect, ObjectInfo,
-    Plugin, TES3Object, TypeInfo,
+    AiPackage, Dialogue, DialogueInfo, DialogueType2, EditorId, EffectId, MagicEffect, NpcFlags,
+    ObjectInfo, Plugin, TES3Object, TypeInfo,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -44,6 +44,7 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
+    print_dialogue_liveness_population(&plugin);
 
     decouple_dialogue_infos(&mut plugin, &base_plugins);
     // Dialogue materialization can introduce references from retained INFOs.
@@ -273,6 +274,9 @@ struct DialogueActor {
 fn collect_dialogue_population(plugin: &Plugin) -> DialoguePopulation {
     let mut population = DialoguePopulation { actors: Vec::new() };
     for object in &plugin.objects {
+        if object.deleted() {
+            continue;
+        }
         match object {
             TES3Object::Npc(npc) => population.actors.push(DialogueActor {
                 id: npc.id.to_ascii_lowercase(),
@@ -288,6 +292,31 @@ fn collect_dialogue_population(plugin: &Plugin) -> DialoguePopulation {
         }
     }
     population
+}
+
+fn print_dialogue_liveness_population(plugin: &Plugin) {
+    println!("Dialogue liveness population begin");
+    for object in &plugin.objects {
+        match object {
+            TES3Object::Npc(npc) => println!(
+                "Dialogue liveness actor\tNpc\t{}\t{}\t{}\t{}",
+                npc.id,
+                npc.race,
+                npc.class,
+                if npc.npc_flags.contains(NpcFlags::FEMALE) {
+                    "female"
+                } else {
+                    "male"
+                }
+            ),
+            TES3Object::Creature(creature) => println!(
+                "Dialogue liveness actor\tCreature\t{}\t\t\t",
+                creature.id
+            ),
+            _ => {}
+        }
+    }
+    println!("Dialogue liveness population end");
 }
 
 fn collect_live_dialogue_topics(
