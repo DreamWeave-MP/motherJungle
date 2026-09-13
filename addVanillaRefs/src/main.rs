@@ -297,6 +297,9 @@ fn collect_dialogue_population(plugin: &Plugin) -> DialoguePopulation {
 fn print_dialogue_liveness_population(plugin: &Plugin) {
     println!("Dialogue liveness population begin");
     for object in &plugin.objects {
+        if object.deleted() {
+            continue;
+        }
         match object {
             TES3Object::Npc(npc) => println!(
                 "Dialogue liveness actor\tNpc\t{}\t{}\t{}\t{}",
