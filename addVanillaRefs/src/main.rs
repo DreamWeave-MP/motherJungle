@@ -44,6 +44,14 @@ fn main() -> std::io::Result<()> {
     }
 
     decouple_dialogue_infos(&mut plugin, &base_plugins);
+    // Dialogue materialization can introduce references from retained INFOs.
+    // Resolve those references before removing the masters from the header.
+    add_vanilla_refs(
+        &mut plugin,
+        &base_plugins,
+        &mut defined_ids,
+        &mut defined_effects,
+    );
 
     // Remove masters from the plugin header.
     let header = plugin.header_mut().unwrap();
@@ -107,9 +115,8 @@ fn decouple_dialogue_infos(plugin: &mut Plugin, base_plugins: &[Plugin]) {
     let starwind_ids = collect_dialogue_ids(plugin);
     let population = collect_dialogue_population(plugin);
     let live_topics = collect_live_dialogue_topics(plugin, &effective_records, &starwind_ids);
-    let (live_infos, audit) =
+    let (live_infos, mut audit) =
         collect_live_dialogue_infos(&effective_records, &starwind_ids, &live_topics, &population);
-    audit.print();
 
     let mut rebuilt = Vec::with_capacity(plugin.objects.len());
     let mut emitted_topics = HashSet::new();
@@ -148,10 +155,12 @@ fn decouple_dialogue_infos(plugin: &mut Plugin, base_plugins: &[Plugin]) {
         if group.dialogue.id.is_empty() {
             continue;
         }
+        audit.add_materialized_topic(topic, live_ids.len(), live_topics.get(topic));
         rebuilt.push(TES3Object::Dialogue(group.dialogue.clone()));
         append_live_dialogue_infos(&mut rebuilt, group, live_ids);
     }
     plugin.objects = rebuilt;
+    audit.print();
 }
 
 fn append_live_dialogue_infos(
@@ -189,6 +198,17 @@ enum DialogueTopicReason {
     DialogueText,
 }
 
+impl DialogueTopicReason {
+    fn name(self) -> &'static str {
+        match self {
+            Self::StarwindTopic => "StarwindTopic",
+            Self::EngineTopic => "EngineTopic",
+            Self::ScriptTopic => "ScriptTopic",
+            Self::DialogueText => "DialogueText",
+        }
+    }
+}
+
 type DialogueTopicReasons = HashMap<String, HashSet<DialogueTopicReason>>;
 
 #[derive(Default)]
@@ -198,11 +218,28 @@ struct DialogueAudit {
     retained_vanilla_infos: usize,
     pruned_vanilla_infos: usize,
     keep_reasons: BTreeMap<&'static str, usize>,
+    materialized_vanilla_topics: BTreeMap<String, (usize, Vec<&'static str>)>,
 }
 
 impl DialogueAudit {
     fn add_reason(&mut self, reason: &'static str) {
         *self.keep_reasons.entry(reason).or_default() += 1;
+    }
+
+    fn add_materialized_topic(
+        &mut self,
+        topic: &str,
+        live_info_count: usize,
+        reasons: Option<&HashSet<DialogueTopicReason>>,
+    ) {
+        let mut reasons: Vec<_> = reasons
+            .into_iter()
+            .flatten()
+            .map(|reason| reason.name())
+            .collect();
+        reasons.sort_unstable();
+        self.materialized_vanilla_topics
+            .insert(topic.to_string(), (live_info_count, reasons));
     }
 
     fn print(&self) {
@@ -215,6 +252,11 @@ impl DialogueAudit {
         );
         for (reason, count) in &self.keep_reasons {
             println!("Dialogue INFO keep reason: {reason}={count}");
+        }
+        for (topic, (live_info_count, reasons)) in &self.materialized_vanilla_topics {
+            println!(
+                "Dialogue DIAL materialized: topic={topic:?} source=vanilla live_infos={live_info_count} topic_reason={reasons:?}"
+            );
         }
     }
 }
@@ -980,8 +1022,8 @@ fn never_copy(object: &TES3Object) -> bool {
 mod tests {
     use super::*;
     use tes3::esp::{
-        AiEscortPackage, AiFollowPackage, Dialogue, Filter, MiscItem, Npc, Race, Script, Spell,
-        Static,
+        AiEscortPackage, AiFollowPackage, Dialogue, Faction, Filter, MiscItem, Npc, Race, Script,
+        Spell, Static,
     };
 
     fn misc_item(id: &str, script: &str) -> TES3Object {
@@ -1327,6 +1369,43 @@ mod tests {
         assert!(has_id(&plugin, "VanillaAInfo"));
         assert!(!has_id(&plugin, "VanillaB"));
         assert!(!has_id(&plugin, "VanillaBInfo"));
+    }
+
+    #[test]
+    fn dialogue_materialization_dependencies_are_resolved_by_second_pass() {
+        let base_plugins = vec![Plugin {
+            objects: vec![
+                dialogue_with_type("Topic", DialogueType2::Voice),
+                dialogue_info_with_constraints("VanillaInfo", "", "", "", "Morag Tong"),
+                TES3Object::Faction(Faction {
+                    id: "Morag Tong".to_string(),
+                    ..Default::default()
+                }),
+            ],
+        }];
+        let mut plugin = Plugin::new();
+        let mut defined_ids = collect_defined_ids(&plugin);
+        let mut defined_effects = HashSet::new();
+
+        add_vanilla_refs(
+            &mut plugin,
+            &base_plugins,
+            &mut defined_ids,
+            &mut defined_effects,
+        );
+        decouple_dialogue_infos(&mut plugin, &base_plugins);
+
+        assert!(has_id(&plugin, "VanillaInfo"));
+        assert!(!has_id(&plugin, "Morag Tong"));
+
+        add_vanilla_refs(
+            &mut plugin,
+            &base_plugins,
+            &mut defined_ids,
+            &mut defined_effects,
+        );
+
+        assert!(has_id(&plugin, "Morag Tong"));
     }
 
     #[test]
