@@ -192,17 +192,17 @@ struct DialoguePopulation {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum DialogueTopicReason {
-    StarwindTopic,
-    EngineTopic,
-    ScriptTopic,
+    Starwind,
+    Engine,
+    Script,
 }
 
 impl DialogueTopicReason {
     fn name(self) -> &'static str {
         match self {
-            Self::StarwindTopic => "StarwindTopic",
-            Self::EngineTopic => "EngineTopic",
-            Self::ScriptTopic => "ScriptTopic",
+            Self::Starwind => "StarwindTopic",
+            Self::Engine => "EngineTopic",
+            Self::Script => "ScriptTopic",
         }
     }
 }
@@ -295,7 +295,7 @@ fn collect_live_dialogue_topics(
         live_topics
             .entry(topic.clone())
             .or_default()
-            .insert(DialogueTopicReason::StarwindTopic);
+            .insert(DialogueTopicReason::Starwind);
     }
     for (topic, group) in records {
         if matches!(
@@ -305,7 +305,7 @@ fn collect_live_dialogue_topics(
             live_topics
                 .entry(topic.clone())
                 .or_default()
-                .insert(DialogueTopicReason::EngineTopic);
+                .insert(DialogueTopicReason::Engine);
         }
     }
 
@@ -357,7 +357,7 @@ fn add_script_topic_references(
             live_topics
                 .entry(topic.clone())
                 .or_default()
-                .insert(DialogueTopicReason::ScriptTopic);
+                .insert(DialogueTopicReason::Script);
         }
     }
 }
@@ -432,10 +432,10 @@ fn add_dialogue_keep_reasons(
     if !faction.is_empty() {
         audit.add_reason("VANILLA_FACTION_UNKNOWN");
     }
-    if topic_reasons.is_some_and(|reasons| reasons.contains(&DialogueTopicReason::ScriptTopic)) {
+    if topic_reasons.is_some_and(|reasons| reasons.contains(&DialogueTopicReason::Script)) {
         audit.add_reason("VANILLA_SCRIPT_TOPIC");
     }
-    if topic_reasons.is_some_and(|reasons| reasons.contains(&DialogueTopicReason::StarwindTopic)) {
+    if topic_reasons.is_some_and(|reasons| reasons.contains(&DialogueTopicReason::Starwind)) {
         audit.add_reason("VANILLA_DIALOGUE_TOPIC");
     }
 }
