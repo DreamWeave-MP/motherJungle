@@ -26,6 +26,7 @@ fn main() -> std::io::Result<()> {
         &base_plugins,
         &mut defined_ids,
         &mut defined_effects,
+        "pre-dialogue",
     );
     for object in &mut plugin.objects {
         let ai_packages = match object {
@@ -54,6 +55,7 @@ fn main() -> std::io::Result<()> {
         &base_plugins,
         &mut defined_ids,
         &mut defined_effects,
+        "post-dialogue",
     );
 
     strip_deleted_records(&mut plugin);
@@ -312,10 +314,9 @@ fn print_dialogue_liveness_population(plugin: &Plugin) {
                     "male"
                 }
             ),
-            TES3Object::Creature(creature) => println!(
-                "Dialogue liveness actor\tCreature\t{}\t\t\t",
-                creature.id
-            ),
+            TES3Object::Creature(creature) => {
+                println!("Dialogue liveness actor\tCreature\t{}\t\t\t", creature.id);
+            }
             _ => {}
         }
     }
@@ -600,6 +601,7 @@ fn add_vanilla_refs(
     base_plugins: &[Plugin],
     defined_ids: &mut HashSet<String>,
     defined_effects: &mut HashSet<EffectId>,
+    pass: &'static str,
 ) {
     add_vanilla_refs_with_dialogue(
         plugin,
@@ -607,6 +609,7 @@ fn add_vanilla_refs(
         defined_ids,
         defined_effects,
         true,
+        pass,
     );
 }
 
@@ -615,6 +618,7 @@ fn add_vanilla_refs_without_dialogue(
     base_plugins: &[Plugin],
     defined_ids: &mut HashSet<String>,
     defined_effects: &mut HashSet<EffectId>,
+    pass: &'static str,
 ) {
     add_vanilla_refs_with_dialogue(
         plugin,
@@ -622,6 +626,7 @@ fn add_vanilla_refs_without_dialogue(
         defined_ids,
         defined_effects,
         false,
+        pass,
     );
 }
 
@@ -631,14 +636,20 @@ fn add_vanilla_refs_with_dialogue(
     defined_ids: &mut HashSet<String>,
     defined_effects: &mut HashSet<EffectId>,
     include_dialogue_dependencies: bool,
+    pass: &'static str,
 ) {
     let vanilla_index = VanillaIndex::new(base_plugins);
-    let mut required_ids = collect_required_ids_with_dialogue(
-        plugin,
-        include_dialogue_dependencies,
-    );
-    let mut pending_ids: VecDeque<_> = required_ids.iter().cloned().collect();
-    pending_ids.make_contiguous().sort();
+    let mut required_ids = HashSet::new();
+    let mut pending_ids = VecDeque::new();
+    for object in plugin.objects.iter().filter(|object| {
+        !object.deleted()
+            && (include_dialogue_dependencies || !matches!(object, TES3Object::DialogueInfo(_)))
+    }) {
+        enqueue_dependencies(object, &mut required_ids, &mut pending_ids, pass);
+    }
+    pending_ids
+        .make_contiguous()
+        .sort_by(|left, right| left.id.cmp(&right.id));
 
     // Resolve the graph to a fixpoint. Every copied record can introduce more
     // references, so those references must go back through the same resolver.
@@ -648,6 +659,7 @@ fn add_vanilla_refs_with_dialogue(
         defined_ids,
         &mut required_ids,
         &mut pending_ids,
+        pass,
     );
 
     // These record classes are intentionally imported wholesale. Their own
@@ -659,6 +671,7 @@ fn add_vanilla_refs_with_dialogue(
         defined_effects,
         &mut required_ids,
         &mut pending_ids,
+        pass,
     );
     resolve_required_ids(
         plugin,
@@ -666,6 +679,7 @@ fn add_vanilla_refs_with_dialogue(
         defined_ids,
         &mut required_ids,
         &mut pending_ids,
+        pass,
     );
 }
 
@@ -674,9 +688,11 @@ fn resolve_required_ids(
     vanilla_index: &VanillaIndex<'_>,
     defined_ids: &mut HashSet<String>,
     required_ids: &mut HashSet<String>,
-    pending_ids: &mut VecDeque<String>,
+    pending_ids: &mut VecDeque<PendingDependency>,
+    pass: &'static str,
 ) {
-    while let Some(id) = pending_ids.pop_front() {
+    while let Some(pending) = pending_ids.pop_front() {
+        let id = pending.id;
         if defined_ids.contains(&id) {
             continue;
         }
@@ -701,7 +717,9 @@ fn resolve_required_ids(
                 .copied()
                 .unwrap_or("master")
         );
-        enqueue_dependencies(object, required_ids, pending_ids);
+        let cause = pending.cause;
+        log_dependency_import(object, &cause);
+        enqueue_dependencies(object, required_ids, pending_ids, pass);
         plugin.objects.push(object.clone());
     }
 }
@@ -712,9 +730,10 @@ fn import_vanilla_foundations(
     defined_ids: &mut HashSet<String>,
     defined_effects: &mut HashSet<EffectId>,
     required_ids: &mut HashSet<String>,
-    pending_ids: &mut VecDeque<String>,
+    pending_ids: &mut VecDeque<PendingDependency>,
+    pass: &'static str,
 ) {
-    for base_plugin in base_plugins {
+    for (source_index, base_plugin) in base_plugins.iter().enumerate() {
         for object in &base_plugin.objects {
             if object.deleted() {
                 continue;
@@ -731,13 +750,39 @@ fn import_vanilla_foundations(
 
             if let TES3Object::MagicEffect(effect) = object {
                 if defined_effects.insert(effect.effect_id) {
-                    enqueue_dependencies(object, required_ids, pending_ids);
+                    log_dependency_import(
+                        object,
+                        &DependencyCause {
+                            pass,
+                            source_type: "FOUNDATION".to_string(),
+                            source_id: VANILLA_PLUGIN_NAMES
+                                .get(source_index)
+                                .copied()
+                                .unwrap_or("master")
+                                .to_string(),
+                            field: "foundation",
+                        },
+                    );
+                    enqueue_dependencies(object, required_ids, pending_ids, pass);
                     plugin.objects.push(object.clone());
                 }
             } else {
                 let id = object.editor_id().to_ascii_lowercase();
                 if defined_ids.insert(id) {
-                    enqueue_dependencies(object, required_ids, pending_ids);
+                    log_dependency_import(
+                        object,
+                        &DependencyCause {
+                            pass,
+                            source_type: "FOUNDATION".to_string(),
+                            source_id: VANILLA_PLUGIN_NAMES
+                                .get(source_index)
+                                .copied()
+                                .unwrap_or("master")
+                                .to_string(),
+                            field: "foundation",
+                        },
+                    );
+                    enqueue_dependencies(object, required_ids, pending_ids, pass);
                     plugin.objects.push(object.clone());
                 }
             }
@@ -745,10 +790,156 @@ fn import_vanilla_foundations(
     }
 }
 
+fn log_dependency_import(object: &TES3Object, cause: &DependencyCause) {
+    println!(
+        "Dependency import:\n  pass={}\n  target={} '{}'\n  source={} '{}'\n  field={}",
+        cause.pass,
+        object.tag_str(),
+        object.editor_id(),
+        cause.source_type,
+        cause.source_id,
+        cause.field,
+    );
+}
+
+#[derive(Clone)]
+struct DependencyCause {
+    pass: &'static str,
+    source_type: String,
+    source_id: String,
+    field: &'static str,
+}
+
+struct PendingDependency {
+    id: String,
+    cause: DependencyCause,
+}
+
+fn dependency_field(object: &TES3Object, target: &str) -> &'static str {
+    let matches = |value: &str| value.eq_ignore_ascii_case(target);
+    match object {
+        TES3Object::DialogueInfo(record) => dependency_field_dialogue_info(record, &matches),
+        TES3Object::Cell(record) => dependency_field_cell(record, &matches),
+        TES3Object::Npc(record) => dependency_field_npc(record, &matches),
+        TES3Object::Creature(record) => dependency_field_creature(record, &matches),
+        _ => "dependency",
+    }
+}
+
+fn dependency_field_dialogue_info(
+    record: &DialogueInfo,
+    matches: &impl Fn(&str) -> bool,
+) -> &'static str {
+    if matches(&record.speaker_id) {
+        "speaker_id"
+    } else if matches(&record.speaker_race) {
+        "speaker_race"
+    } else if matches(&record.speaker_class) {
+        "speaker_class"
+    } else if matches(&record.speaker_faction) {
+        "speaker_faction"
+    } else {
+        "player_faction"
+    }
+}
+
+fn dependency_field_cell(
+    record: &tes3::esp::Cell,
+    matches: &impl Fn(&str) -> bool,
+) -> &'static str {
+    for reference in record.references.values() {
+        if matches(&reference.id) {
+            return "reference.id";
+        }
+        if reference.owner.as_deref().is_some_and(matches) {
+            return "reference.owner";
+        }
+        if reference.owner_global.as_deref().is_some_and(matches) {
+            return "reference.owner_global";
+        }
+        if reference.owner_faction.as_deref().is_some_and(matches) {
+            return "reference.owner_faction";
+        }
+        if reference.key.as_deref().is_some_and(matches) {
+            return "reference.key";
+        }
+        if reference.trap.as_deref().is_some_and(matches) {
+            return "reference.trap";
+        }
+        if reference.soul.as_deref().is_some_and(matches) {
+            return "reference.soul";
+        }
+    }
+    "region"
+}
+
+fn dependency_field_npc(record: &tes3::esp::Npc, matches: &impl Fn(&str) -> bool) -> &'static str {
+    if matches(&record.script) {
+        "script"
+    } else if record.inventory.iter().any(|(_, value)| matches(value)) {
+        "inventory"
+    } else if record.spells.iter().any(|value| matches(value)) {
+        "spells"
+    } else if record.ai_packages.iter().any(|package| match package {
+        AiPackage::Activate(value) => matches(&value.target),
+        AiPackage::Escort(value) => matches(&value.target),
+        AiPackage::Follow(value) => matches(&value.target),
+        _ => false,
+    }) {
+        "ai_package.target"
+    } else if matches(&record.race) {
+        "race"
+    } else if matches(&record.class) {
+        "class"
+    } else if matches(&record.faction) {
+        "faction"
+    } else if matches(&record.head) {
+        "head"
+    } else if matches(&record.hair) {
+        "hair"
+    } else {
+        "dependency"
+    }
+}
+
+fn dependency_field_creature(
+    record: &tes3::esp::Creature,
+    matches: &impl Fn(&str) -> bool,
+) -> &'static str {
+    if matches(&record.script) {
+        "script"
+    } else if record.inventory.iter().any(|(_, value)| matches(value)) {
+        "inventory"
+    } else if record.spells.iter().any(|value| matches(value)) {
+        "spells"
+    } else if record.ai_packages.iter().any(|package| match package {
+        AiPackage::Activate(value) => matches(&value.target),
+        AiPackage::Escort(value) => matches(&value.target),
+        AiPackage::Follow(value) => matches(&value.target),
+        _ => false,
+    }) {
+        "ai_package.target"
+    } else {
+        "sound"
+    }
+}
+
+fn source_id(object: &TES3Object) -> String {
+    let editor_id = object.editor_id();
+    if !editor_id.is_empty() {
+        return editor_id.to_string();
+    }
+    if let TES3Object::Cell(cell) = object {
+        return cell.name.clone();
+    }
+    "<anonymous>".to_string()
+}
+
 fn enqueue_dependencies(
     object: &TES3Object,
     required_ids: &mut HashSet<String>,
-    pending_ids: &mut VecDeque<String>,
+    pending_ids: &mut VecDeque<PendingDependency>,
+    pass: &'static str,
 ) {
     let mut dependencies: Vec<_> = collect_required_ids_from_object(object)
         .into_iter()
@@ -756,7 +947,15 @@ fn enqueue_dependencies(
     dependencies.sort();
     for id in dependencies {
         if !id.is_empty() && required_ids.insert(id.clone()) {
-            pending_ids.push_back(id);
+            pending_ids.push_back(PendingDependency {
+                cause: DependencyCause {
+                    pass,
+                    source_type: object.tag_str().to_string(),
+                    source_id: source_id(object),
+                    field: dependency_field(object, &id),
+                },
+                id,
+            });
         }
     }
 }
@@ -776,6 +975,7 @@ fn collect_required_ids(plugin: &Plugin) -> HashSet<String> {
     collect_required_ids_with_dialogue(plugin, true)
 }
 
+#[cfg(test)]
 fn collect_required_ids_with_dialogue(
     plugin: &Plugin,
     include_dialogue_dependencies: bool,
@@ -799,9 +999,9 @@ fn remove_exact_duplicate_magic_effects(plugin: &mut Plugin) {
     let mut retained = Vec::new();
     for object in plugin.objects.drain(..) {
         if let TES3Object::MagicEffect(effect) = &object {
-            if retained.iter().any(|retained| {
-                matches!(retained, TES3Object::MagicEffect(other) if other == effect)
-            }) {
+            if retained.iter().any(
+                |retained| matches!(retained, TES3Object::MagicEffect(other) if other == effect),
+            ) {
                 continue;
             }
         }
@@ -1183,6 +1383,7 @@ mod tests {
             &masters,
             &mut defined_ids,
             &mut defined_effects,
+            "post-dialogue",
         );
 
         assert!(has_id(&plugin, "first_dependency"));
@@ -1209,6 +1410,7 @@ mod tests {
             &masters,
             &mut defined_ids,
             &mut defined_effects,
+            "pre-dialogue",
         );
 
         assert!(!has_id(&plugin, "vanilla_speaker"));
@@ -1218,6 +1420,7 @@ mod tests {
             &masters,
             &mut defined_ids,
             &mut defined_effects,
+            "post-dialogue",
         );
 
         assert!(has_id(&plugin, "vanilla_speaker"));
@@ -1243,6 +1446,7 @@ mod tests {
             &masters,
             &mut defined_ids,
             &mut defined_effects,
+            "post-dialogue",
         );
 
         assert!(!has_id(&plugin, "unwanted_dependency"));
@@ -1288,6 +1492,7 @@ mod tests {
             &masters,
             &mut defined_ids,
             &mut defined_effects,
+            "post-dialogue",
         );
 
         assert!(has_id(&plugin, "shared_dependency"));
@@ -1329,6 +1534,7 @@ mod tests {
             &[bloodmoon],
             &mut defined_ids,
             &mut defined_effects,
+            "post-dialogue",
         );
 
         assert!(has_id(&plugin, "vanilla_race"));
@@ -1371,6 +1577,7 @@ mod tests {
             &masters,
             &mut defined_ids,
             &mut defined_effects,
+            "post-dialogue",
         );
 
         assert!(has_id(&plugin, "escort_target"));
@@ -1530,6 +1737,7 @@ mod tests {
             &base_plugins,
             &mut defined_ids,
             &mut defined_effects,
+            "post-dialogue",
         );
         decouple_dialogue_infos(&mut plugin, &base_plugins);
 
@@ -1541,6 +1749,7 @@ mod tests {
             &base_plugins,
             &mut defined_ids,
             &mut defined_effects,
+            "post-dialogue",
         );
 
         assert!(has_id(&plugin, "Morag Tong"));
